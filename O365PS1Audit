@@ -1,0 +1,1238 @@
+#Requires -Version 5.1
+
+<#
+	.SYNOPSIS
+		Collection for Office 365 AES
+
+	.DESCRIPTION
+        Capture script for collecting information from Office 365 Tenancy for Office 365 SOA
+
+        This script is Intellectual Property of Microsoft.
+    
+    .PARAMETER OutputDir
+        Specified the directory where to store the collection resulsts, this directory is used by
+        the analysis script.
+    
+    .PARAMETER GetCalendarSharing
+        Switch for retrieving calendar sharing information. This may be possible in smaller tenancies,
+        but for time constraints, this defaults to off.
+    
+    .PARAMETER Connect
+        Specifying this parameter will make the script automatically connect to Azure AD Version 1 (MSOL)
+        Azure AD Version 2, and Exchange Online MFA Remote PowerShell. Script will ask for credentials for each
+        as multifactor authentication is required.
+
+    .PARAMETER PrecollectComplete
+        In instances where the script is ran multiple times, it may be required to prevent the script from
+        re-running the Get-Mailbox and Get-CasMailbox commands (for time savings). This will prevent the re-running
+        of the pre-collect function, but may result in the data set being old.
+
+    .PARAMETER NoAAD
+        Skips the Azure AD collectors. This should only be done in very specific circumstances.
+        
+        You cannot use this flag without also turning off SharePoint with -NoSPO or -SPO:$False.
+
+        Setting this will set -AAD:$False automatically
+
+    .PARAMETER NoEXO
+        Skips the Exchnage Online collectors. Setting this flag will set -EXO:$False automatically
+    
+    .PARAMETER NoSCC
+        Skips the Security and Compliance Center collectors. Setting this flag will set -SCC:$False automatically
+
+    .PARAMETER NoSPO
+        Skips the SharePoint Online collectors. While generally used for script debugging, it can also be used
+        in cases where SharePoint Online is not being used. Setting this flag will set -SPO:$False automatically
+
+    .PARAMETER NoPnP
+        Skips  SharePoint Online collectors that rely on the Patterns and Practices (PnP) library. This can be used if
+        the PnP library is causing connection problems. Setting this flag will set -SPPNP:$False automatically
+
+    .PARAMETER SPOAdmin
+        The UPN of the user whose credentials are being used to run the script. This is used to temporaily grant the user
+        access to SharePoint Online content in order to collect the necessariy configuration data.
+        
+    .PARAMETER SiteCollectionLimit
+        The maxium number of SharePoint site collections to interrogate. Collecting configuration information from site
+        collections is expensive and time consuming. The script will limit itself to 50 site collections by default. Less
+        or more site collections can be included in the collection by adjusting this value. By setting SiteCollectionLimit
+        to 0, all site collections will be examined.
+
+    .PARAMETER SPOTenantName
+        The name of the SharePoint Online tenant to use when deriving SPO host names.
+
+    .PARAMETER SPOPermissionOptIn
+        Skips SharePoint Online collectors that need to temporarily make the nominated SPOAdmin user a Site Collection
+        Administrator on site collections being analysed.
+
+    .PARAMETER UseIEProxyConfig
+        When proxy's are required, you may need to use the proxy configuration from IE to connect.
+        This creates a PSSession Option which is used for Remote PowerShell.
+
+	.NOTES
+		Cam Murray
+		Field Engineer - Microsoft
+		cam.murray@microsoft.com
+
+		Andres Canello
+		Field Engineer - Microsoft
+		andresc@microsoft.com
+		
+		Last update: 5 October 2017
+
+	.LINK
+		about_functions_advanced
+
+#>
+
+Param(
+    [CmdletBinding()]
+    [Parameter(Mandatory=$false)]
+    [String]$OutputDir,
+    [Switch]$GetCalendarSharing,
+    [Switch]$Connect,
+    [Switch]$PrecollectComplete,
+    [Switch]$PrecollectOnlyEXO1,
+    [Switch]$PrecollectOnlyEXO2,
+    [Switch]$PrecollectOnlyAAD,
+    [Switch]$BypassPrereqCheck,
+    [Int32]$PrecollectLimit=0,
+    [Switch]$NoAAD,
+    [Switch]$NoEXO,
+    [Switch]$NoSPO,
+    [Switch]$NoPnP,
+    [Switch]$NoSCC,
+    [Switch]$NoSFBO,
+    [Boolean]$AAD=$True,
+    [Boolean]$EXO=$True,
+    [Boolean]$SFBO=$True,
+    [Boolean]$SPPNP=$True,
+    [Boolean]$SPO=$True,
+    [Boolean]$SCC=$True,
+    [Switch]$UseIEProxyConfig,
+    [String]$SPOAdmin,
+    [Int32]$SiteCollectionLimit=250,
+    [String]$SPOTenantName,
+    [Switch]$SPOPermissionOptIn,
+    # These are hidden for now until we want to promote Graph collection
+    [Parameter(DontShow)]
+    [Boolean]$Graph=$False,
+    [Parameter(DontShow)]
+    [String]$GraphAppCred,
+    [Parameter(DontShow)]
+    [Switch]$NoGraph
+)
+
+# Version
+$Version = "1.11"
+
+#region Functions
+
+Function OutJS {
+    param(
+        [parameter(
+            Mandatory         = $true,
+            ValueFromPipeline = $true)]
+        [object[]] $Data,
+        $File
+        )
+    Begin{$Output = @()} #begin
+    Process{
+        $Output += $Data
+        
+    }
+    End{
+        $Output | ConvertTo-Json -Depth 20 | Out-File -FilePath $File
+    } #end
+}
+
+
+function Get-RoleMembers365 {
+    $365RoleMembers = @()
+
+    ForEach($rg in (Get-MsolRole)) {
+	    ForEach($rgm in (Get-MsolRoleMember -RoleObjectId $rg.ObjectId)) {
+		    $365RoleMembers += New-Object -TypeName psobject -Property @{
+			    Role=$($rg.Name)
+			    Member=$($rgm.EmailAddress)
+			    MFARequirements=$($rgm.StrongAuthenticationRequirements.State)
+        	    }
+	    }
+    }
+
+    return $365RoleMembers
+
+}
+
+function Get-AzureSKUs {
+
+    # Gets the Azure SKU's (Licenses)
+    $skus = @()
+
+    ForEach($sku in (Get-AzureADSubscribedSku)) {
+        $skus += New-Object -TypeName psobject -Property @{
+            SkuPartNumber=$($sku.SkuPartNumber)
+            Consumed=$($sku.ConsumedUnits)
+            Enabled=$($sku.PrepaidUnits.Enabled)
+            Suspended=$($sku.PrepaidUnits.Suspended)
+            Warning=$($sku.PrepaidUnits.Warning)   
+        }
+    }
+
+    return $skus
+}
+
+function Get-RoleMembersEXO {
+    $EXORoleMembers = @()
+
+    ForEach($rg in (Get-RoleGroup)) {
+        ForEach($rgm in (Get-RoleGroupMember -Identity $rg.Identity)) {
+            $EXORoleMembers += New-Object -TypeName psobject -Property @{
+                            Role=$($rg.Identity)
+                            Member=$($rgm.Name)
+                            Type=$($rgm.RecipientType)
+            }
+        }
+    }
+
+    Return $EXORoleMembers
+}
+
+function Get-RoleMembersSCC {
+    param(
+        $sessionSCC
+    )
+    $SCCRoleMembers = @()
+
+    ForEach($rg in (Invoke-Command -Session $sessionSCC -ScriptBlock {Get-RoleGroup})) {
+        ForEach($rgm in (Invoke-Command -Session $sessionSCC -ScriptBlock {param($RGIdentity) Get-RoleGroupMember -Identity $RGIdentity} -ArgumentList $rg.Identity)) {
+            # Get AAD User for MFA requirements
+            $AADUser = Get-MsolUser -UserPrincipalName $($rgm.WindowsLiveID)
+            $SCCRoleMembers += New-Object -TypeName psobject -Property @{
+                            Role=$($rg.DisplayName)
+                            Member=$($rgm.WindowsLiveID)
+                            MFARequirements=$($AADUser.StrongAuthenticationRequirements.State)
+                            MFADefault=$($AADUser.StrongAuthenticationMethods | Where-Object {$_.IsDefault}).MethodType
+            }
+        }
+    }
+
+    Return $SCCRoleMembers
+}
+
+function Get-ProtocolEnablement {
+    Param(
+    [System.Array]$CASMailboxes
+    )
+
+    return New-Object psobject -Property @{
+        ActiveSync = [int]($CASMailboxes | Where-Object {$_.ActiveSyncEnabled -eq $true}).Count
+        OWA = [int]($CASMailboxes | Where-Object {$_.OWAEnabled -eq $true}).Count
+        POP = [int]($CASMailboxes | Where-Object {$_.PopEnabled -eq $true}).Count
+        IMAP = [int]($CASMailboxes | Where-Object {$_.ImapEnabled -eq $true}).Count
+        MAPI = [int]($CASMailboxes | Where-Object {$_.MapiEnabled -eq $true}).Count
+        UniversalOutlook = [int]($CASMailboxes | Where-Object {$_.UniversalOutlookEnabled -eq $true}).Count
+        EWS = [int]($CASMailboxes | Where-Object {$_.EWSEnabled -eq $true -or [string]::IsNullOrEmpty($_.EWSEnabled)}).Count
+        EWSOutlook = [int]($CASMailboxes | Where-Object {$_.EWSAllowOutlook -eq $true -or [string]::IsNullOrEmpty($_.EWSAllowOutlook)}).Count
+        EWSMacOutlook = [int]($CASMailboxes | Where-Object {$_.EwsAllowMacOutlook -eq $true -or [string]::IsNullOrEmpty($_.EWSAllowMacOutlook)}).Count
+        EWSEntourage = [int]($CASMailboxes | Where-Object {$_.EwsAllowEntourage -eq $true -or [string]::IsNullOrEmpty($_.EWSAllowEntourage)}).Count
+        SMTP = [int]($CASMailboxes | Where-Object {$_.SmtpClientAuthenticationDisabled -ne $true}).Count
+        Total = $CASMailboxes.Count
+    }
+
+}
+
+function Get-MailboxAuditSettings {
+    Param(
+    [System.Array]$Mailboxes
+    )
+
+    $MailboxLogin = 0
+    $UpdateInboxRules = 0 
+    $UpdateFolderPermissions = 0
+    $UpdateCalendarDelegation = 0
+
+    ForEach($mb in $Mailboxes) {
+        #Since moving to 
+        if($mb.AuditOwner -like "*MailboxLogin*") {$MailboxLogin++}
+        if($mb.AuditOwner -like "*UpdateInboxRules*") {$UpdateInboxRules++}
+        if($mb.AuditOwner -like "*UpdateFolderPermissions*") {$UpdateFolderPermissions++}
+        if($mb.AuditOwner -like "*UpdateCalendarPermissions*") {$UpdateCalendarPermissions++}
+    }
+
+    Return New-Object PsObject -Property @{
+        Total=$Mailboxes.Count
+        AuditEnabled=($Mailboxes | Where-Object {$_.AuditEnabled -eq $true}).Count
+        AuditOwnerLogin=$MailboxLogin
+        AuditOwnerInboxRules=$UpdateInboxRules
+        AuditOwnerFolderPermissions=$UpdateFolderPermissions
+        AuditOwnerCalendarDelegation=$UpdateCalendarDelegation
+    }
+}
+
+function Get-CalendarSharing {
+    Param(
+        [System.Array]$Mailboxes
+    )
+    ForEach($mailbox in $Mailboxes) {
+
+    Write-Verbose "Checking $($mailbox.Identity)"
+
+    # Get users calendar folder settings for their default Calendar folder
+
+    $cf=Get-MailboxCalendarFolder -Identity "$($mailbox.Identity):\Calendar" 
+
+    # If publishing is turned on, add to the result set
+
+    if($cf.PublishEnabled -eq $true) {
+
+        $cfs += New-Object -TypeName psobject -Property @{
+
+            UserPrincipalName=$mailbox.UserPrincipalName
+            PublishEnabled=$cf.PublishEnabled
+            DetailLevel=$cf.DetailLevel
+            PublishedCalendarUrl=$cf.PublishedCalendarUrl
+            PublishedICalUrl=$cf.PublishedICalUrl
+
+        }
+
+    }
+
+    }
+
+    return $cfs
+}
+
+function Get-RoleAssignmentPoliciesAndEntries {
+
+    $return = @()
+
+    ForEach($ra in (Get-RoleAssignmentPolicy)) {
+
+        $re = @()
+
+        ForEach($role in $ra.AssignedRoles) {
+            $re += (Get-ManagementRoleEntry "$role\*")
+        }
+
+        $return += New-Object psobject -Property @{
+            Name=$($ra.Name)
+            IsDefault=$($ra.IsDefault)
+            Description=$($ra.Description)
+            RoleAssignments=$($ra.RoleAssignments)
+            AssignedRoles=$($ra.AssignedRoles)
+            RoleEntries=$re
+        } 
+    }
+
+    return $return
+
+}
+
+function Get-SPOTenantName
+{
+    if ($SPOTenantName)
+    {
+        return $SPOTenantName
+    }
+    else {
+        $sku = (Get-MsolAccountSku)[0]
+        return $sku.AccountName
+    }
+}
+#Get SharePoint Admin URL
+function Get-SharePointAdminUrl
+{
+    $tenantName = Get-SPOTenantName
+    
+    $url = "https://" + $tenantName + "-admin.sharepoint.com"
+    return $url
+}
+
+function Get-SharePointDefaultUrl
+{
+    $tenantName = Get-SPOTenantName
+
+    $url = "https://" + $tenantName + ".sharepoint.com"
+    return $url
+}
+
+$Global:IsSPConnected = $false
+
+function Get-PnPConnection
+{
+    Param(
+        [Parameter(Mandatory=$True)]
+        [string]$Url
+    )
+    
+    if(!$Global:IsSPConnected)
+    {
+        Connect-PnPOnline -Url $Url -SPOManagementShell -ClearTokenCache
+        $Global:IsSPConnected = $true
+    }
+    else {
+        try {
+            Connect-PnPOnline -Url $Url -SPOManagementShell -ErrorAction:SilentlyContinue
+        }
+        catch {
+            # Supressing the exception
+            Write-Verbose "Call to Connect-PnPOnline failed"
+        }  
+    }
+   
+}
+
+function Get-SPOTenantProperties
+{
+    $return = Get-SPOTenant
+    
+    return $return
+}
+
+Add-Type -TypeDefinition @"
+   public enum SiteCollectionAdminState
+   {
+        Needed,
+        NotNeeded,
+        Skip
+   }
+"@
+
+function Grant-SiteCollectionAdmin
+{
+    Param(
+        [Parameter(Mandatory=$True)]
+        [Microsoft.Online.SharePoint.PowerShell.SPOSite]$Site
+    )
+
+    [SiteCollectionAdminState]$adminState = [SiteCollectionAdminState]::NotNeeded
+
+    # Determine if admin rights need to be granted
+    try {
+        $adminUser = Get-SPOUser -site $Site -LoginName $SPOAdmin -ErrorAction:SilentlyContinue
+        $needsAdmin = ($false -eq $adminUser.IsSiteAdmin)
+    }
+    catch {
+        $needsAdmin = $true
+    }
+
+    # Skip this site collection if the current user does not have permissions and
+    # permission changes should not be made ($SPOPermissionOptOut)
+    if ($needsAdmin -and $SPOPermissionOptIn -eq $false)
+    {
+        Write-Verbose "$(Get-Date) Grant-SiteCollectionAdmin Skipping $($Site.URL) Needs Admin $needsAdmin PermissionOptIn $SPOPermissionOptIn"
+        [SiteCollectionAdminState]$adminState = [SiteCollectionAdminState]::Skip
+    }
+    # Grant access to the site collection, if required
+    elseif ($needsAdmin)
+    {
+        try{
+            Write-Verbose "$(Get-Date) Grant-SiteCollectionAdmin Adding $($SPOAdmin) $($Site.URL) Needs Admin $needsAdmin PermissionOptIn $SPOPermissionOptIn"
+            Set-SPOUser -site $Site -LoginName $SPOAdmin -IsSiteCollectionAdmin $True | Out-Null
+    
+            # Workaround for a race condition that has PnP connect to SPO before the permission access is committed
+            Start-Sleep -Seconds 1
+    
+            [SiteCollectionAdminState]$adminState = [SiteCollectionAdminState]::Needed
+        }
+        catch{
+            Write-Verbose "Cannot assign permissions to Site Collection $($Site.URL)"
+        }
+    }
+
+    Write-Verbose "$(Get-Date) Grant-SiteCollectionAdmin Finished"
+
+    return $adminState
+}
+
+function Revoke-SiteCollectionAdmin
+{
+    Param(
+        [Parameter(Mandatory=$True)]
+        [Microsoft.Online.SharePoint.PowerShell.SPOSite]$Site,
+        [Parameter(Mandatory=$True)]
+        [SiteCollectionAdminState]$AdminState
+    )
+
+    # Cleanup permission changes, if any
+    if ($AdminState -eq [SiteCollectionAdminState]::Needed)
+    {
+        Write-Verbose "$(Get-Date) Revoke-SiteCollectionAdmin $($site.url) Revoking $SPOAdmin"
+        Set-SPOUser -site $Site -LoginName $SPOAdmin -IsSiteCollectionAdmin $False | Out-Null
+    }
+    
+    Write-Verbose "$(Get-Date) Revoke-SiteCollectionAdmin Finished"
+}
+
+function Get-SPOPersonalSiteProperties {
+
+    $return = @()
+
+    # Get all Site Collections, including personal sites
+    Write-Verbose "$(Get-Date) Getting SPO Sites with Personal Sites"
+    $sites = Get-SPOSite -Limit ALL -IncludePersonalSite:$true
+    Write-Verbose "$(Get-Date) Getting SPO Sites Complete. Count $($sites.count)"
+
+    # Isolate the personal sites
+    $personalSites = $sites | Where-Object { $_.Url -match 'my.sharepoint.com/personal'}
+
+    # Determine the number of site collections to iterate
+    $maxSites = $personalSites.Count
+    if (($maxSites -gt $siteCollectionLimit) -and ($siteCollectionLimit -ne 0))
+    { 
+        $maxSites = $siteCollectionLimit 
+    }
+
+    # Process each site collection
+    for ($i=0; $i -lt $maxSites; $i++)
+    {
+        $site = $personalSites[$i]
+
+        Write-Progress -Activity "SharePoint Collection" -Status "Personal Site Properties ($i of $maxSites)" -CurrentOperation "$($site.Url)" -PercentComplete ($i / $maxSites * 100)                
+
+        Write-Verbose "Processing $($site.Url)"
+
+        # Grant access to the site collection, if needed AND allowed
+        [SiteCollectionAdminState]$adminState = Grant-SiteCollectionAdmin -Site $site
+
+        # Skip this site collection if permission is not granted
+        if ($adminState -eq [SiteCollectionAdminState]::Skip)
+        {
+            continue
+        }
+
+        # Locate the OD4B library
+        $list = $null
+        $enableVersioning = "Unknown"
+        if ($false -eq $NoPnP)
+        {
+            Get-PnPConnection -Url $site.Url
+
+            try {
+                $list = Get-PnPList 'Documents'
+            }
+            catch {
+                # Supressing the exception
+                Write-Verbose "OD4B list could not be accessed"
+                $list = $null
+            }
+        }
+
+        # Collect the versioning status
+        if ($list)
+        {
+            $enableVersioning = $list.EnableVersioning
+        }
+
+        $return += New-Object psobject -Property @{
+            Url=$($site.Url)
+            EnableVersioning=$($enableVersioning)
+        } 
+
+        # Cleanup permission changes, if any
+        Revoke-SiteCollectionAdmin -Site $site -AdminState $adminState
+    }
+
+    return $return
+}
+
+function Get-SPOSiteCollectionProperties {
+
+    $return = @()
+
+    # Get all Site Collections, excluding personal sites
+    Write-Verbose "$(Get-Date) Get-SPOSiteCollectionProperties Getting SPO Sites without Personal Sites"
+    $sites = Get-SPOSite -Limit ALL 
+    Write-Verbose "$(Get-Date) Get-SPOSiteCollectionProperties Getting SPO Sites Complete. Count $($sites.count)"
+
+     # Isolate the valid sites - Matches *.sharepoint.com/sites/*, *.sharepoint.com/teams/*, *.sharepoint.com
+     #$validSites = $sites | `
+     #   Where-Object { $_.Url -match '((\.sharepoint\.com\/(sites|teams))|(^https:\/\/.+(?<!-my)\.sharepoint\.com\/?$))'}
+
+    # Removing root site to resolve Bug 151 - SPO site collection does not exclude the root site
+    $validSites = $sites | Where-Object {$_.url -match '(\.sharepoint\.com\/(sites|teams))'}
+
+    # Determine the number of site collections to iterate
+    $maxSites = $validSites.Count
+    if (($maxSites -gt $siteCollectionLimit) -and ($siteCollectionLimit -ne 0))
+    { 
+        $maxSites = $siteCollectionLimit 
+    }
+
+    # Process each site collection
+    for ($i=0; $i -lt $maxSites; $i++)
+    {
+        $site = $validSites[$i]
+        Write-Progress -Activity "SharePoint Collection" -Status "Site Collection Properties ($i of $maxSites)" -CurrentOperation "$($site.Url)" -PercentComplete ($i / $maxSites * 100)        
+
+        Write-Verbose "$(Get-Date) Get-SPOSiteCollectionProperties Processing $($site.Url)"
+        # Grant permission to the site collection, if needed AND allowed
+        [SiteCollectionAdminState]$adminState = Grant-SiteCollectionAdmin -Site $site
+
+        # Skip this site collection if permission is not granted
+        if ($adminState -eq [SiteCollectionAdminState]::Skip)
+        {
+            continue
+        }
+
+        # Count the admins
+        Write-Verbose "$(Get-Date) Get-SPOSiteCollectionProperties $site Collecting SPO Users for Site"
+        $siteAdmins = Get-SPOUser -Site $site -Limit ALL | Where-Object { $_.IsSiteAdmin -eq $true}
+        Write-Verbose "$(Get-Date) Get-SPOSiteCollectionProperties $site SiteAdmins $($siteAdmins.Count)"
+
+        $return += New-Object psobject -Property @{
+            Url=$($site.Url)
+            AdminCount=$($siteAdmins.Count)
+        } 
+
+        # Cleanup permission changes, if any
+        Revoke-SiteCollectionAdmin -Site $site -AdminState $adminState
+    }
+
+    return $return
+}
+
+#endregion
+
+#region Start
+
+if(!$OutputDir) {
+    # Use default output directory
+    $OutputDir = $PSScriptRoot + "\Collection\"
+    if(!(Test-Path($OutputDir))) { 
+        try { md $OutputDir  -ErrorAction:Stop | Out-Null } catch { Write-Error "Cannot create output directory $OutputDir"; exit; }
+    }
+} else {
+    if(!(Test-Path($OutputDir))) {
+        Write-Error "Output directory $OutputDir does not exist and must be created first"; exit;
+    }
+}
+
+$TranscriptName = "Collection-Transcript.txt"
+$Precollect = $Null
+If($PrecollectOnlyAAD -eq $true) { $TranscriptName="Collection-Transcript-Pre_AAD.txt"; $Precollect = "AAD"}
+If($PrecollectOnlyEXO1 -eq $true) { $TranscriptName="Collection-Transcript-Pre_EXO1.txt"; $Precollect = "EXO1"}
+If($PrecollectOnlyEXO2 -eq $true) { $TranscriptName="Collection-Transcript-Pre_EXO2.txt"; $Precollect = "EXO2"}
+
+Start-Transcript -Path "$OutputDir\$TranscriptName" -Append
+
+
+#region ModuleCheck
+Function Check-ModuleExists {
+    Param($ModuleName)
+    If(!(Get-Module -ListAvailable | Where-Object {$_.Name -eq $ModuleName})) {
+        Write-Error "Required Module $($ModuleName) does not appear to be installed. Ensure pre-requisites are followed."
+        return $false
+    } else {
+        return $true
+    }
+}
+
+# Disable components in precollect only phases
+
+If($PrecollectOnlyAAD) {
+    $SFBO = $false
+    $AAD = $True
+    $NoEXO = $True
+    $NoPNP = $True
+    $NoSCC = $True
+    $NoSPO = $True
+}
+
+If($PrecollectOnlyEXO1 -eq $true -or $PrecollectOnlyEXO2 -eq $true) {
+    $SFBO = $false
+    $AAD = $False
+    $NoPNP = $True
+    $NoSCC = $True
+    $NoSPO = $True
+}
+
+# Flag checks
+If($NoAAD) { $AAD=$False }
+If($NoSFBO) { $SFBO=$False }
+If($NoEXO) { $EXO=$False }
+If($NoPNP) { $SPPNP=$False }
+If($NoSPO) { $SPO=$False }
+If($NoSCC) { $SCC=$False }
+If($NoGraph) { $Graph=$False }
+
+<#
+
+Pre-requisite determinations - some connections require the use of others
+
+#>
+
+# SPO Requires AAD
+If($SPO -eq $True -and $AAD -eq $False) {
+    Write-Error "The connection code for SharePoint Online requires Azure AD collection"
+    Exit
+}
+
+# Show options
+Write-Host "$(Get-Date) Collection Options..."
+Write-Host ""
+Write-Host "Collection Script Version: $($Version)" -ForegroundColor Green
+Write-Host "Collection Directory: $($OutputDir)" -ForegroundColor Green
+Write-Host "AAD: $($AAD)" -ForegroundColor Green
+Write-Host "SharePoint:  $($SPO)"  -ForegroundColor Green
+Write-Host "SharePoint PnP:  $($SPPNP)"  -ForegroundColor Green
+Write-Host "Exchange:  $($EXO)"  -ForegroundColor Green
+Write-Host "Skype For Business:  $($SFBO)"  -ForegroundColor Green
+Write-Host "Security and Compliance Center:  $($SCC)"  -ForegroundColor Green
+Write-Host "Graph: $($Graph)" -ForegroundColor Green
+Write-Host "SharePoint Site Collection Limit: $($SiteCollectionLimit)"  -ForegroundColor Green
+Write-Host "SharePoint Permissions Opt-In: $($SPOPermissionOptIn)" -ForegroundColor Green
+Write-Host "SharePoint Admin (Auto if blank): $($SPOAdmin)"  -ForegroundColor Green
+Write-Host "SharePoint Tenant (Auto if blank): $($SPOTenantName)"  -ForegroundColor Green
+Write-Host "Exchange Calendar Sharing: $($GetCalendarSharing)"  -ForegroundColor Green
+Write-Host "Precollect Limit: $($PrecollectLimit)"  -ForegroundColor Green
+Write-Host "Precollect Complete: $($PrecollectComplete)" -ForegroundColor Green
+Write-Host "Precollect Phases: $($Precollect)" -ForegroundColor Green
+Write-Host "Use IE Proxy Config: $(if($UseIEProxyConfig) { "Yes" } else { "No"} )"  -ForegroundColor Green
+Write-Host ""
+
+If(!$SPOPermissionOptIn) {
+    Write-Host "$(Get-Date) [INFO] Engineer has not opted-IN to Site-Level checks that require the addition of Site Collection Administrator permissions. Check the Delivery Guide for more information!" -ForegroundColor Yellow
+}
+
+If(!$BypassPrereqCheck) {
+    Write-Host "$(Get-Date) Checking pre-requisites..."
+
+    $RequiredModulesExist = @()
+
+    If($True -eq $AAD) {
+        $RequiredModulesExist += (Check-ModuleExists -ModuleName "AzureADPreview")
+        $RequiredModulesExist += (Check-ModuleExists -ModuleName "MSOnline") 
+    }
+
+    If($False -eq $NoPNP) { $RequiredModulesExist += (Check-ModuleExists -ModuleName "SharePointPnPPowerShellOnline") }
+    If($False -eq $NoSPO) { $RequiredModulesExist += (Check-ModuleExists -ModuleName "Microsoft.Online.SharePoint.PowerShell") }
+    if($True -eq $SFBO) { $RequiredModulesExist += (Check-ModuleExists -ModuleName "SkypeOnlineConnector") }
+
+    If($RequiredModulesExist -contains $false) { Exit; }
+}
+
+#endregion
+
+# Determine if SPOAdmin is mandatory
+#if (-Not ($SPOPermissionOptOut -or $SPOAdmin)) {Write-Error "SPOAdmin is a mandatory argument if SPOPermissionOptOut is not specified"; Exit}
+
+# Check if required to connect
+
+if($Connect) {
+
+    If ($UseIEProxyConfig) {
+        Write-Host "$(Get-Date) [INFO] Engineer has specified using IE Proxy Settings" -ForegroundColor Green
+        $ProxySetting = New-PSSessionOption -ProxyAccessType IEConfig
+    } Else {
+        $ProxySetting = New-PSSessionOption -ProxyAccessType None
+    }
+
+    # If EXO or SCC
+
+    If($EXO -eq $True -or $SCC -eq $True) {
+        If(!(Get-Command "Connect-EXOPSSession" -ErrorAction:SilentlyContinue)) {
+
+            # Change back path after completion
+            $CurrentPath = Get-Location
+
+            Write-Host "$(Get-Date) Not ran from an EXO PowerShell Module window - attempt to autoload starting"
+            # Attempt to load automatically
+            $modules = @(Get-ChildItem -Path "$($env:LOCALAPPDATA)\Apps\2.0" -Filter "Microsoft.Exchange.Management.ExoPowershellModule.manifest" -Recurse )
+            $moduleName =  Join-Path $modules[0].Directory.FullName "Microsoft.Exchange.Management.ExoPowershellModule.dll"
+            Import-Module -FullyQualifiedName $moduleName -Force
+            $scriptName =  Join-Path $modules[0].Directory.FullName "CreateExoPSSession.ps1"
+            . $scriptName
+            If(!(Get-Command "Connect-EXOPSSession" -ErrorAction:SilentlyContinue)) {
+                Write-Error "Run from a Exchange Online MFA Enabled PowerShell window to auto connect. Attempt to automatically load failed. http://aka.ms/exopspreview"
+                Exit
+            }
+            
+            # Change back path
+            Set-Location $CurrentPath
+        }
+    }
+
+    Write-Host "$(Get-Date) Connecting..."
+
+    # This component is mandatory
+    Write-Host "$(Get-Date) Connecting to Azure AD PowerShell 1.."
+    Connect-MsolService
+    
+    # AAD Connection
+    If($AAD -eq $True) {
+        Write-Host "$(Get-Date) Connecting to Azure AD PowerShell 2.."
+        $AADConnection = Connect-AzureAD
+    }
+
+    if($false -eq $NoSCC) {
+        Write-Host "$(Get-Date) Connecting to Security and Compliance Center.."
+        Connect-IPPSSession -PSSessionOption $ProxySetting -WarningAction:SilentlyContinue  | Out-Null
+        $sessionSCC = (Get-PSSession | Where-Object {$_.ComputerName -like "*protection.outlook.com"})
+    }
+
+    if($false -eq $NoEXO) {
+        Write-Host "$(Get-Date) Connecting to Exchange Online.."
+        Connect-EXOPSSession -PSSessionOption $ProxySetting -WarningAction:SilentlyContinue | Out-Null
+    }
+
+    If($SPO -eq $True) {
+        If(!$SPOAdmin) {
+            $SPOAdmin = $AADConnection.Account.Id
+        }
+
+        Write-Host "$(Get-Date) Connecting to SharePoint Online.."
+        $adminUrl = Get-SharePointAdminUrl
+        Connect-SPOService -Url $adminUrl | Out-Null
+    }
+
+    <#if ($false -eq $NoPnP)
+    {
+        Write-Host "$(Get-Date) Connecting to SharePoint Online via PnP.."
+        $defaultUrl = Get-SharePointDefaultUrl
+        Get-PnPConnection -Url $defaultUrl | Out-Null
+    }#>
+    
+    if($true -eq $SFBO) {
+
+        Write-Host "$(Get-Date) Connecting to Skype for Business Online..."
+        $SfBOAdminDomain = (Get-AzureADTenantDetail | Select-Object -ExpandProperty VerifiedDomains | Where-Object { $_.Initial }).Name
+        $SfBOSession = New-CsOnlineSession -OverrideAdminDomain $SfBOAdminDomain
+
+        Import-PSSession -Session $SfBOSession -AllowClobber | Out-Null
+
+    }
+
+    if($true -eq $Graph) {
+        <#
+        
+        IMPORTANT: When reading the below, it's important to note this is in development and NOT performed by default!
+                    The following is only executed if -Graph:$True is passed to this collection script. This is not
+                    performed by any engineer other than in testing.
+
+        #>
+
+        # Determine if Azure AD Application Exists. Otherwise die
+        $GraphApp = Get-AzureADApplication -Filter "displayName eq 'Office 365 Security Optimization Assessment'" | Where-Object {$_.ReplyUrls -Contains "https://security.optimization.assessment.local"}
+
+        If($GraphApp) {
+
+            # Provision a short lived credential +48 hrs if we havent been given one. Reason for so long: timezones.
+            If(!$GraphAppCred) {
+                $GraphAppCred = (New-AzureADApplicationPasswordCredential -ObjectId $GraphApp.ObjectId -EndDate (Get-Date).AddDays(2) -CustomKeyIdentifier "Assessment on $(Get-Date -Format "dd-MMM-yyyy")" -ErrorAction:Stop).Value
+            }
+
+            # Let the password sink in - stop race condition
+            Sleep 60
+
+            # Get the default MSOL domain
+            $GraphAppDomain = (Get-AzureADTenantDetail | Select-Object -ExpandProperty VerifiedDomains | Where-Object { $_.Initial }).Name
+
+        } Else {
+
+            Write-Error "The pre-requisites for doing Graph do not appear to have been set up. If you're in the trial - ensure that you follow the instructions for setting up the App"
+            Exit
+
+        }
+    }
+}
+
+Function Precollect-EXO1 {
+    Param($OutputDir,$PrecollectLimit,$sessionEXO)
+    Write-Host "$(Get-Date) Running pre-collection - Exchange Online Phase 1"
+    If($PrecollectLimit -eq 0) {
+        $Results = Invoke-Command -Session $sessionEXO -ScriptBlock {Get-Mailbox -ResultSize:Unlimited | Select-Object -Property ForwardingSmtpAddress,AuditEnabled,AuditOwner,RoleAssignmentPolicy,RecipientTypeDetails,LitigationHoldEnabled}
+    } else {
+        $Results = Invoke-Command -Session $sessionEXO -ScriptBlock {param($PrecollectLimit) Get-Mailbox -ResultSize:$PrecollectLimit | Select-Object -Property ForwardingSmtpAddress,AuditEnabled,AuditOwner,RoleAssignmentPolicy,RecipientTypeDetails,LitigationHoldEnabled} -ArgumentList $PrecollectLimit
+    }
+    $Results | Export-Csv "$OutputDir\EXO-Mailboxes.csv" -NoTypeInformation
+}
+
+Function Precollect-EXO2 {
+    Param($OutputDir,$PrecollectLimit,$sessionEXO)
+    Write-Host "$(Get-Date) Running pre-collection - Exchange Online Phase 2"
+    If($PrecollectLimit -eq 0) {
+        Invoke-Command -Session $sessionEXO -ScriptBlock {Get-CasMailbox -ResultSize:Unlimited | Select-Object -Property Guid,SmtpClientAuthenticationDisabled,ActiveSyncEnabled,OWAEnabled,OWAforDevicesEnabled,ECPEnabled,PopEnabled,ImapEnabled,MAPIEnabled,UniversalOutlookEnabled,EwsEnabled,EwsAllowOutlook,EwsAllowMacOutlook,EwsAllowEntourage} | Export-CSV $OutputDir\EXO-CasMailbox.csv -NoTypeInformation
+    } else {
+        Invoke-Command -Session $sessionEXO -ScriptBlock {param($PrecollectLimit) Get-CasMailbox -ResultSize:$PrecollectLimit | Select-Object -Property ActiveSyncEnabled,OWAEnabled,OWAforDevicesEnabled,ECPEnabled,PopEnabled,ImapEnabled,MAPIEnabled,UniversalOutlookEnabled,EwsEnabled,EwsAllowOutlook} -ArgumentList $PrecollectLimit | Export-CSV $OutputDir\EXO-CasMailbox.csv -NoTypeInformation
+    }
+}
+
+Function Precollect-AAD {
+    Param($OutputDir,$PrecollectLimit)
+    Write-Host "$(Get-Date) Running pre-collection - Azure AD"
+    If($PrecollectLimit -eq 0) {
+        Get-MsolUser -All | Select-Object StrongAuthenticationRequirements,StrongAuthenticationMethods,LastPasswordChangeTimestamp | ConvertTo-Json -Depth 20 | Out-File -FilePath $OutputDir\AAD-User.json
+    } else {
+        Get-MsolUser -MaxResults $PrecollectLimit | Select-Object StrongAuthenticationRequirements,StrongAuthenticationMethods,LastPasswordChangeTimestamp | ConvertTo-Json -Depth 20 | Out-File -FilePath $OutputDir\AAD-User.json
+    }
+}
+
+$sessionEXO = (Get-PSSession | Where-Object {$_.ComputerName -eq "outlook.office365.com"})
+
+# Perform precollect only, for speeding up larger deployments by splitting the precollect
+If($PrecollectOnlyEXO1) {
+    Write-Host "$(Get-Date) Pre-collection of EXO1 will only be conducted, then the script will exit"
+    Precollect-EXO1 -OutputDir $OutputDir -PrecollectLimit $PrecollectLimit -sessionEXO $sessionEXO
+    Write-Host "$(Get-Date) Pre-collect of EXO1 complete"
+    exit
+}
+
+If($PrecollectOnlyEXO2) {
+    Write-Host "$(Get-Date) Pre-collection of EXO2 will only be conducted, then the script will exit"
+    Precollect-EXO2 -OutputDir $OutputDir -PrecollectLimit $PrecollectLimit -sessionEXO $sessionEXO
+    Write-Host "$(Get-Date) Pre-collect of EXO2 complete"
+    exit
+}
+
+If($PrecollectOnlyAAD) {
+    Write-Host "$(Get-Date) Pre-collection of AAD will only be conducted, then the script will exit"
+    Precollect-AAD -OutputDir $OutputDir -PrecollectLimit $PrecollectLimit
+    Write-Host "$(Get-Date) Pre-collect of AAD complete"
+    exit
+}
+
+# Check connected
+
+If($false -eq $NoSCC) {
+if($sessionSCC.State -ne "Opened") {
+    If($sessionSCC -eq $null) {
+        $sessionSCC = (Get-PSSession | Where-Object {$_.ComputerName -like "*protection.outlook.com"})
+    }
+    # Connect EXO Session can close SCC, so re-open it
+    $sessionSCC = New-PSSession -Session $sessionSCC
+}
+}
+
+Function Get-GraphAuthHeader {
+    Param(
+        $ClientID,
+        $ClientSecret,
+        $TenantDomain,
+        $LoginURL="https://login.windows.net/",
+        $Resource="https://graph.microsoft.com/"
+    )
+
+    # Get an Oauth 2 access token based on client id, secret and tenant domain
+    $body       = @{grant_type="client_credentials";resource=$Resource;client_id=$clientID;client_secret=$ClientSecret}
+    $oauth      = Invoke-RestMethod -Method Post -Uri $loginURL/$tenantdomain/oauth2/token?api-version=1.0 -Body $body
+
+    if ($oauth.access_token -ne $null) {
+        Return @{'Authorization'="$($oauth.token_type) $($oauth.access_token)"}
+    } Else {
+        Write-Error "Failed to get token."
+        Return $False
+    }
+}
+
+If($AAD -eq $True) {
+    try {Get-MsolCompanyInformation -ErrorAction:stop | Out-Null} catch {Write-Error "This script requires you to be connected to MSOL v1 as a Global Administrator. Run Connect-MsolService first"; Exit}
+    try {Get-AzureADTenantDetail -ErrorAction:stop | Out-Null} catch {Write-Error "This script requires you to be connected to Azure AD PowerShell v2.0 as a Global Administrator. Run Connect-AzureAD first";  Exit}
+}
+
+If($false -eq $NoEXO) { try {Get-Command Set-Mailbox -ErrorAction:stop | Out-Null} catch {Write-Error "This script requires you to be connected to Exchange Online Remote PowerShell. Run Connect-EXOPSSession (for new PowerShell EXO module) or connect using a PSSession.";Exit}}
+If($false -eq $NoSPO) { try {Get-SPOTenant -ErrorAction:stop | Out-Null} catch {Write-Error "This script requires you to be connected to SPO as a SharePoint Online Administrator. Run Connect-SPOService first"; Exit}}
+If($false -eq $NoSCC) { If($sessionSCC.State -ne "Opened") {Write-Error "This script requires you to be connected to Security and Compliance Center. You must run Connect-IPPSSession FIRST and then Connect-EXOPSSession SECOND."; Exit}}
+If($true -eq $SFBO) { try {Get-CsTenant -ErrorAction:Stop -WarningAction:SilentlyContinue | Out-Null} catch {Write-Error "This script requires you to be connected to SfBO as a Skype for Business Online Administrator. Run New-CsOnlineSession first"; Exit}}
+
+# Other checks
+If($SPOPermissionOptIn -and -Not $SPOAdmin)  {Write-Error "SPOAdmin account was not automatically detected. You must specify -SPOAdmin if SPOPermissionOptIn was selected"; Exit}
+
+#endregion
+
+# Misc checks prior to collection
+If(Get-Command "Get-AtpPolicyForO365" -ErrorAction:SilentlyContinue) { $AtpCommands = $true } else { $AtpCommands = $false }
+#endregion
+
+#region Precollect
+
+If(!$PrecollectComplete) {
+
+    Write-Host "$(Get-Date) Running pre-collection"
+    If($EXO -eq $True) {
+        Precollect-EXO1 -OutputDir $OutputDir  -PrecollectLimit $PrecollectLimit -sessionEXO $sessionEXO
+        Precollect-EXO2 -OutputDir $OutputDir -PrecollectLimit $PrecollectLimit -sessionEXO $sessionEXO
+        
+        $Mailboxes = Import-CSV $OutputDir\EXO-Mailboxes.csv
+        $CASMailboxes = Import-CSV $OutputDir\EXO-CasMailbox.csv
+    }
+
+    If($AAD -eq $True) {
+        Precollect-AAD -OutputDir $OutputDir -PrecollectLimit $PrecollectLimit -sessionEXO $sessionEXO
+        $AUsers = (Get-content $OutputDir\AAD-User.json | ConvertFrom-Json)
+    }
+}
+
+#endregion
+
+#region Collect
+
+$CollectInfo = New-Object -TypeName PSObject -Property @{
+    TenantName=$(Get-SPOTenantName)
+    Version=$Version
+    sharepoint=$(if(!$NoSPO) { $True } else { $False} )
+    exchange=$(if(!$NoEXO) { $True } else { $False} )
+    skype=$(if($SFBO) { $True } else { $False})
+    aad=$($AAD)
+    scc=$($SCC)
+    graph=$($Graph)
+    pnp=$($SPPNP)
+    guid=[guid]::NewGuid().Guid
+    date=(Get-Date)
+}
+
+$CollectInfo | ConvertTo-Json -Depth 15 | Out-File   "$OutputDir\SOA-CollectionInfo.json"
+
+#region SCC
+If($false -eq $NoSCC) {
+    Write-Host "$(Get-Date) Getting Security and Compliance Center Information"
+    Get-RoleMembersSCC -sessionSCC $sessionSCC | ConvertTo-Json -Depth 15 | Out-File -FilePath  "$OutputDir\SCC-RoleMembers.json"
+    Invoke-Command -Session $SessionSCC -ScriptBlock {Get-ActivityAlert} | ConvertTo-Json -Depth 15 | Out-File   "$OutputDir\SCC-ActivityAlert.json"
+    Invoke-Command -Session $SessionSCC -ScriptBlock {Get-ProtectionAlert} | ConvertTo-Json -Depth 15 | Out-File   "$OutputDir\SCC-ProtectionAlert.json"
+    Invoke-Command -Session $SessionSCC -ScriptBlock {Get-AuditConfig} | ConvertTo-Json -Depth 15 | Out-File   "$OutputDir\SCC-AuditConfig.json"
+    Invoke-Command -Session $SessionSCC -ScriptBlock {Get-DlpCompliancePolicy} | ConvertTo-Json -Depth 15 | Out-File   "$OutputDir\SCC-DlpCompliancePolicy.json"
+    Invoke-Command -Session $SessionSCC -ScriptBlock {Get-RetentionCompliancePolicy -DistributionDetail} | ConvertTo-Json -Depth 15 | Out-File   "$OutputDir\SCC-RetentionCompliancePolicy.json"
+    Write-Host "$(Get-Date) Get DLP Information"
+    Invoke-Command -Session $SessionSCC -ScriptBlock {Get-dlpsidetectionsReport} | ConvertTo-Json -Depth 15 | Out-File  "$OutputDir\SCC-DLPSIDReport.json"
+    Write-Host "$(Get-Date) Getting Office 365 Device Management Policies"
+    Invoke-Command -Session $SessionSCC -ScriptBlock {Get-DeviceConditionalAccessRule} | ConvertTo-Json -Depth 15 | Out-File   "$OutputDir\SCC-DeviceConditionalAccessRule.json"
+}
+#endregion
+
+#region EXO
+
+if ($false -eq $NoEXO)
+{
+#region Collect - Organisational Config...
+Write-Host "$(Get-Date) Getting Organisational Configuration"
+Get-OrganizationConfig | ConvertTo-Json -Depth 15 | Out-File  "$OutputDir\EXO-OrganizationConfig.json"
+#endregion
+#region Collect - Role Group Members
+Write-Host "$(Get-Date) Getting Exchange Online Role Group Members"
+Get-RoleMembersEXO | Export-CSV "$OutputDir\EXO-RoleGroupMembers.CSV" -NoTypeInformation
+#endregion
+Write-Host "$(Get-Date) Getting Exchange User Options"
+Get-User -RecipientTypeDetails UserMailbox -ResultSize:5000 | Select RemotePowerShellEnabled  | ConvertTo-Json -Depth 20 | Out-File -FilePath "$OutputDir\EXO-User.json"
+#region Collect - Protocol Enablement
+Write-Host "$(Get-Date) Getting Protocol Enablement Settings"
+Get-ProtocolEnablement -CASMailboxes $CASMailboxes | Export-CSV "$OutputDir\EXO-ProtocolEnablement.csv" -NoTypeInformation
+#endregion
+#region Collect - Transport Config
+Write-Host "$(Get-Date) Getting Transport Configuration"
+Get-TransportConfig | ConvertTo-Json -Depth 15 | Out-File  "$OutputDir\EXO-TransportConfig.json"
+#endregion
+#region Collect - ATP Settings
+If($AtpCommands) {
+    Write-Host "$(Get-Date) Getting Advanced Threat Protection Settings"
+    Get-SafeAttachmentPolicy | ConvertTo-Json -Depth 20 | Out-File -FilePath "$OutputDir\EXO-SafeAttachmentsPolicy.json"
+    Get-SafeAttachmentRule | ConvertTo-Json -Depth 20 | Out-File -FilePath  "$OutputDir\EXO-SafeAttachmentsRules.json"
+    Get-SafeLinksPolicy | ConvertTo-Json -Depth 20 | Out-File -FilePath "$OutputDir\EXO-SafeLinksPolicy.json"
+    Get-SafeLinksRule | ConvertTo-Json -Depth 20 | Out-File -FilePath  "$OutputDir\EXO-SafeLinksRules.json"
+    Get-AtpPolicyForO365 | ConvertTo-Json -Depth 20 | Out-File -FilePath  "$OutputDir\365-AtpPolicy.json"
+} else {
+    Write-Host "$(Get-Date) Getting Advanced Threat Protection Settings - Skipped - Commands not found (No License?)"
+}
+#endregion
+#region Collect - Domains
+Write-Host "$(Get-Date) Getting Accepted Domains"
+Get-AcceptedDomain | ConvertTo-Json -Depth 20 | Out-File -FilePath "$OutputDir\EXO-AcceptedDomains.json"
+#endregion
+#region Collect - Antispam Settings
+Write-Host "$(Get-Date) Getting Anti-Spam Settings"
+Get-HostedConnectionFilterPolicy | ConvertTo-Json -Depth 20 | Out-File -FilePath  "$OutputDir\EXO-HostedConnectionFilterPolicy.json"
+Get-HostedContentFilterPolicy | ConvertTo-Json -Depth 20 | Out-File -FilePath  "$OutputDir\EXO-HostedContentFilterPolicy.json"
+Get-HostedContentFilterRule | ConvertTo-Json -Depth 20 | Out-File -FilePath  "$OutputDir\EXO-HostedContentFilterRule.json"
+Get-HostedOutboundSpamFilterPolicy | ConvertTo-Json -Depth 20 | Out-File -FilePath  "$OutputDir\EXO-HostedOutboundSpamFilterPolicy.json"
+#endregion
+#region Collect - Antiphish Settings
+Write-Host "$(Get-Date) Getting Anti Phish Settings"
+Get-AntiphishPolicy | ConvertTo-Json -Depth 15 | Out-File "$OutputDir\EXO-AntiPhishPolicy.json"
+#endregion
+#region Collect - Antimalware Settings
+Write-Host "$(Get-Date) Getting Anti-Malware Settings"
+Get-MalwareFilterPolicy | ConvertTo-Json -Depth 20 | Out-File -FilePath  "$OutputDir\EXO-MalwareFilterPolicy.json"
+Get-MalwareFilterRule | ConvertTo-Json -Depth 20 | Out-File -FilePath  "$OutputDir\EXO-MalwareFilterRule.json"
+#endregion
+#region Collect - Connector Settings
+Write-Host "$(Get-Date) Getting Connector Settings"
+Get-InboundConnector | ConvertTo-Json -Depth 15 | Out-File  "$OutputDir\EXO-InboundConnector.json"
+Get-OutboundConnector | ConvertTo-Json -Depth 15 | Out-File  "$OutputDir\EXO-OutboundConnector.json"
+#endregion
+#region Collect - Transport Rules
+Write-Host "$(Get-Date) Getting Transport Rules"
+Get-TransportRule | ConvertTo-Json -Depth 15 | Out-File  "$OutputDir\EXO-TransportRules.json"
+#endregion
+#region Collect - Remote Domains
+Write-Host "$(Get-Date) Getting Remote Domains"
+Get-RemoteDomain | ConvertTo-Json -Depth 15 | Out-File  "$OutputDir\EXO-RemoteDomain.json"
+#endregion
+#region Collect - Organisation Sharing
+Write-Host "$(Get-Date) Getting Organisation Sharing"
+Get-SharingPolicy | ConvertTo-Json -Depth 20 | Out-File -FilePath  "$OutputDir\EXO-SharingPolicy.json"
+#endregion
+#region Collect - Auditing
+Write-Host "$(Get-Date) Getting Auditing Settings"
+Get-AdminAuditLogConfig | ConvertTo-Json -Depth 15 | Out-File  "$OutputDir\EXO-AdminAuditLogConfig.json"
+Get-MailboxAuditSettings -Mailboxes $mailboxes | Export-CSV "$OutputDir\EXO-MailboxAuditSettings.csv" -NoTypeInformation
+#endregion
+#region Collect - EAS Policies
+Write-Host "$(Get-Date) Getting EAS Policies"
+Get-MobileDeviceMailboxPolicy  | ConvertTo-Json -Depth 15 | Out-File  "$OutputDir\EXO-MobileDeviceMailboxPolicy.json"
+#endregion
+#region Collect - Role Assignment Policy and Entries
+Write-Host "$(Get-Date) Getting Role Assignment Policies and Entries"
+Get-RoleAssignmentPoliciesAndEntries | ConvertTo-Json -Depth 15 | Out-File  "$OutputDir\EXO-RoleAssignmentPoliciesEntries.json"
+#endregion
+#region Collect - DKIM Signing Configuration
+Write-Host "$(Get-Date) Getting DKIM Signing Configuration"
+Get-DkimSigningConfig | ConvertTo-Json -Depth 15 | Out-File  "$OutputDir\EXO-DKIMSigningConfig.json"
+#endregion
+#region Collect - Report Schedule...
+Write-Host "$(Get-Date) Getting Report Schedule List"
+Get-ReportScheduleList | Select-Object Identity,ScheduleName,Report*,Direction,*Date,NotificationEmail,*Address | ConvertTo-Json -Depth 15 | Out-File  "$OutputDir\EXO-ReportScheduleList.json"
+#endregion
+#region Collect - Calendar Sharing
+if($GetCalendarSharing) {
+    Write-Host "$(Get-Date) Getting calendar sharing"
+    Get-CalendarSharing | Export-CSV "$OutputDir\EXO-CalendarShares.csv" -NoTypeInformation
+}
+#endregion
+}
+#endregion
+
+#region Collect - Azure AD
+If($AAD -eq $True) {
+    Write-Host "$(Get-Date) Getting Misc Information"
+    Get-MsolCompanyInformation | Select-Object UsersPermissionToUserConsentToAppEnabled | ConvertTo-Json -Depth 15 | Out-File "$OutputDir\AAD-CompanyInformation.json"
+    Write-Host "$(Get-Date) Getting Azure AD Custom Setings"
+    (Get-AzureADDirectorySetting -All $True).Values | ConvertTo-Json -Depth 15 | Out-File  "$OutputDir\AAD-DirectorySettings.json"
+    Write-Host "$(Get-Date) Getting Azure AD Policies"
+    Get-AzureADPolicy | ConvertTo-Json -Depth 15 | Out-File "$OutputDir\AAD-Policies.json"
+    Get-MsolDeviceRegistrationServicePolicy | ConvertTo-Json -Depth 15 | Out-File "$OutputDir\AAD-DeviceRegistrationPolicy.json"
+    Write-Host "$(Get-Date) Getting Azure Directory Synchronisation Settings"
+    Get-MsolDirSyncFeatures | ConvertTo-Json -Depth 15 | Out-File "$OutputDir\AAD-MsolDirSyncSettings.json"
+    Write-Host "$(Get-Date) Getting Azure AD SKUs"
+    Get-AzureSKUs | Export-CSV "$OutputDir\AAD-SKUs.csv"
+    Write-Host "$(Get-Date) Getting Azure AD Role Group Members"
+    Get-RoleMembers365 | Export-CSV "$OutputDir\O365-RoleGroupMembers.CSV" -NoTypeInformation
+}
+#endregion
+
+#region SfBO
+
+if ($true -eq $SFBO)
+{
+    #region Collect - Get-CsOnlineDialInConferencingSettings
+    Write-Host "$(Get-Date) Getting SfBO Online Dial In Conferencing Tenant Settings"
+    Get-CsOnlineDialInConferencingTenantSettings -ErrorAction SilentlyContinue | ConvertTo-Json -Depth 15 | Out-File -FilePath "$OutputDir\SfBO-OnlineDialInConferencingTenantSettings.json"
+    #endregion
+
+    #region Collect - Get-CsMeetingConfiguration
+    Write-Host "$(Get-Date) Getting SfBO Meeting Configuration"
+    Get-CsMeetingConfiguration  | ConvertTo-Json -Depth 15 | Out-File -FilePath  "$OutputDir\SfBO-MeetingConfiguration.json"
+    #endregion
+
+    #region Collect - Get-CsExternalUserCommunicationPolicy
+    Write-Host "$(Get-Date) Getting SfBO External User Communication Policy"
+    Get-CsExternalUserCommunicationPolicy  | ConvertTo-Json -Depth 15 | Out-File -FilePath  "$OutputDir\SfBO-ExternalUserCommunicationPolicy.json"
+    #endregion
+
+    #region Collect - Get-CsMobilityPolicy
+    Write-Host "$(Get-Date) Getting SfBO Mobility Policy"
+    Get-CsMobilityPolicy -WarningAction:SilentlyContinue | ConvertTo-Json -Depth 15 | Out-File -FilePath  "$OutputDir\SfBO-MobilityPolicy.json"
+    #endregion
+
+    #region Collect - Get-CsConferencingPolicy
+    Write-Host "$(Get-Date) Getting SfBO Conferencing Policy"
+    Get-CsConferencingPolicy -WarningAction:SilentlyContinue | ConvertTo-Json -Depth 15 | Out-File -FilePath "$OutputDir\SfBO-ConferencingPolicy.json"
+    #endregion
+
+    #region Collect - Get-CsOAuthConfiguration
+    Write-Host "$(Get-Date) Getting SfBO OAuth Configuration"
+    Get-CsOAuthConfiguration  | ConvertTo-Json -Depth 15 | Out-File -FilePath  "$OutputDir\SfBO-OAuthConfiguration.json"
+    #endregion
+}
+
+#endregion
+
+
+#region SPO
+
+    if ($false -eq $NoSPO)
+    {
+        #region Collect - Get-SPOTenant
+        Write-Host "$(Get-Date) Getting SPO Tenant Properties"
+        Get-SPOTenantProperties | ConvertTo-Json -Depth 20 | Out-File -FilePath  "$OutputDir\SPO-TenantProperties.json"
+        #endregion
+
+        #region Collect - Site Collection Properties
+        Write-Host "$(Get-Date) Getting Site Collection Properties"
+        Get-SPOSiteCollectionProperties | ConvertTo-Json -Depth 20 | Out-File -FilePath  "$OutputDir\SPO-SiteCollectionProperties.json"
+        #endregion
+
+        #region Collect - Personal Site Properties
+        #Write-Host "$(Get-Date) Getting Personal Site Properties"
+        #Get-SPOPersonalSiteProperties | Export-Clixml "$OutputDir\SPO-PersonalSiteProperties.xml"
+        #endregion
+    }
+
+#endregion
+
+#region Graph
+    If($true -eq $Graph) {
+
+        $msgraphEndpoint = "https://graph.microsoft.com/"
+
+        # Get Auth Header
+        $GraphAuthHeader = Get-GraphAuthHeader -ClientID $GraphApp.AppId -ClientSecret $GraphAppCred -TenantDomain $GraphAppDomain
+
+        If($GraphAuthHeader -ne $False) {
+
+            Write-Host "$(Get-Date) Graph - Collecting AIP Risk Events"
+            (Invoke-WebRequest -Headers $GraphAuthHeader -Uri "$msgraphEndpoint/beta/identityRiskEvents").Content | Out-File "$OutputDir\AAD-RiskEvents.json"
+
+            Write-Host "$(Get-Date) Graph - Getting Secure Scores"
+            (Invoke-WebRequest -Headers $GraphAuthHeader -Uri "$msgraphEndpoint/beta/security/secureScores").Content |  Out-File "$OutputDir\365-SecureScores.json"
+            
+        } Else {
+            Write-Error "Failed to get Graph authentication, so cannot perform Graph collection."
+        }
+    }
+#endregion
+
+#region Collect - Manifest
+$files = @{}
+$ignoredfiles = "Collection-Transcript.txt"
+ForEach($File in (Get-ChildItem $OutputDir)) {
+    If($ignoredfiles -notcontains $File.Name) {
+    $files.Add($File.Name.ToString(),(Get-FileHash($File.FullName)).Hash)
+    }
+}
+$Files | Export-Clixml "$OutputDir\Manifest.xml"
+#endregion
+
+# Insights
+$Insight = New-Object -TypeName PSObject -Property @{
+    cid=$CollectInfo.TenantName
+    mid=$CollectInfo.guid
+    Version=$Version
+    sharepoint=$(if(!$NoSPO) { $True } else { $False} )
+    exchange=$(if(!$NoEXO) { $True } else { $False} )
+    skype=$(if($SFBO) { $True } else { $False})
+    aad=$($AAD)
+    scc=$($SCC)
+    graph=$($Graph)
+    pnp=$($SPPNP)
+    RunType="collect"
+}
+
+Try {
+    Invoke-RestMethod -ErrorAction:SilentlyContinue -Uri "http://soainsi.azurewebsites.net/api/insights" -method POST -ContentType 'application/json' -Body (ConvertTo-Json $Insight)
+} Catch {}
+
+#endregion
+
+Write-Host ("")
+
+Stop-Transcript
